@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import json
+import pickle
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -12,20 +11,9 @@ st.title("Часть 5 | Streamlit: EDA + Inference + Weights")
 BASE = Path(__file__).parent
 
 @st.cache_resource
-def load_model(path: Path):
-    return joblib.load(path)
-
-@st.cache_data
-def load_json(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = 0.0
-    return df[cols]
+def load_pipeline(path: Path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 def safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -33,43 +21,48 @@ def safe_numeric(df: pd.DataFrame) -> pd.DataFrame:
         out[c] = pd.to_numeric(out[c], errors="ignore")
     return out
 
-def extract_coef(model):
-    if hasattr(model, "coef_"):
-        return np.asarray(model.coef_).ravel()
-    if hasattr(model, "named_steps"):
-        for step_name in reversed(list(model.named_steps.keys())):
-            est = model.named_steps[step_name]
-            if hasattr(est, "coef_"):
-                return np.asarray(est.coef_).ravel()
+def extract_estimator(pipe):
+    if hasattr(pipe, "named_steps"):
+        return pipe.named_steps.get("model", None)
     return None
 
-MODELS = {
-    "LinearRegression (8 фич)": ("lin_reg.joblib", "features_8.json"),
-    "Lasso best (8 фич)": ("best_lasso.joblib", "features_8.json"),
-    "ElasticNet best (8 фич)": ("best_enet.joblib", "features_8.json"),
-    "Ridge best (52 фич)": ("best_ridge.joblib", "features_52.json"),
+def extract_coef(pipe):
+    est = extract_estimator(pipe)
+    if est is not None and hasattr(est, "coef_"):
+        return np.asarray(est.coef_).ravel()
+    if hasattr(pipe, "coef_"):
+        return np.asarray(pipe.coef_).ravel()
+    return None
+
+def get_feature_names_from_pipeline(pipe):
+    if hasattr(pipe, "feature_names_in_"):
+        return list(pipe.feature_names_in_)
+    return None
+
+PIPELINES = {
+    "LinearRegression (8 фич)": "lin_reg_pipeline.pkl",
+    "Lasso best (8 фич)": "best_lasso_pipeline.pkl",
+    "ElasticNet best (8 фич)": "best_enet_pipeline.pkl",
+    "Ridge best (52 фич)": "best_ridge_pipeline.pkl",
 }
 
 st.sidebar.header("Настройки")
-model_name = st.sidebar.selectbox("Выберите модель", list(MODELS.keys()))
-model_file, feat_file = MODELS[model_name]
+model_name = st.sidebar.selectbox("Выберите модель", list(PIPELINES.keys()))
+pipe_file = PIPELINES[model_name]
+pipe_path = BASE / pipe_file
 
-model_path = BASE / model_file
-feat_path = BASE / feat_file
-
-if not model_path.exists():
-    st.error(f"Не найден файл модели: {model_file}")
+if not pipe_path.exists():
+    st.error(f"Не найден файл пайплайна: {pipe_file}. Положите его рядом с app.py")
     st.stop()
 
-if not feat_path.exists():
-    st.error(f"Не найден файл признаков: {feat_file}")
-    st.stop()
+pipe = load_pipeline(pipe_path)
+feat_cols = get_feature_names_from_pipeline(pipe)
 
-model = load_model(model_path)
-feat_cols = load_json(feat_path)
-
-st.sidebar.caption(f"Файл модели: {model_file}")
-st.sidebar.caption(f"Кол-во признаков: {len(feat_cols)}")
+st.sidebar.caption(f"Файл пайплайна: {pipe_file}")
+if feat_cols is not None:
+    st.sidebar.caption(f"Кол-во признаков: {len(feat_cols)}")
+else:
+    st.sidebar.caption("Кол-во признаков: неизвестно (нет feature_names_in_)")
 
 tab_eda, tab_infer, tab_weights = st.tabs(["1) EDA", "2) Inference", "3) Weights"])
 
@@ -135,11 +128,21 @@ with tab_infer:
         if up:
             df_in = pd.read_csv(up)
             df_in = safe_numeric(df_in)
-
             st.dataframe(df_in.head(20), use_container_width=True)
 
-            X = ensure_columns(df_in, feat_cols)
-            preds = model.predict(X)
+            if feat_cols is not None:
+                missing = [c for c in feat_cols if c not in df_in.columns]
+                extra = [c for c in df_in.columns if c not in feat_cols]
+                if missing:
+                    st.warning(f"В CSV не хватает {len(missing)} признаков. Пример: {missing[:5]}")
+                if extra:
+                    st.info(f"В CSV есть лишние колонки (будут проигнорированы): {extra[:5]}")
+
+                X = df_in.reindex(columns=feat_cols)
+            else:
+                X = df_in
+
+            preds = pipe.predict(X)
             out = df_in.copy()
             out["prediction"] = preds
 
@@ -151,7 +154,12 @@ with tab_infer:
                 file_name="predictions.csv",
                 mime="text/csv",
             )
+
     else:
+        if feat_cols is None:
+            st.error("Не удалось определить список признаков из пайплайна. Для ручного ввода нужны feature_names_in_.")
+            st.stop()
+
         values = {}
         cols = st.columns(2)
         for i, f in enumerate(feat_cols):
@@ -160,17 +168,18 @@ with tab_infer:
 
         if st.button("Предсказать"):
             X_one = pd.DataFrame([values])
-            pred = float(model.predict(X_one)[0])
+            pred = float(pipe.predict(X_one)[0])
             st.success(f"Prediction: {pred:.6f}")
 
 with tab_weights:
     st.subheader("Веса модели")
 
-    coefs = extract_coef(model)
+    coefs = extract_coef(pipe)
     if coefs is None:
+        st.error("У выбранной модели не удалось извлечь coef_.")
         st.stop()
 
-    if len(coefs) != len(feat_cols):
+    if feat_cols is None or len(coefs) != len(feat_cols):
         feat_names = [f"f{i}" for i in range(len(coefs))]
     else:
         feat_names = feat_cols
@@ -178,7 +187,7 @@ with tab_weights:
     df_w = pd.DataFrame({"feature": feat_names, "weight": coefs})
     df_w["abs_weight"] = df_w["weight"].abs()
 
-    top_k = st.slider("Top-K", 5, min(50, len(df_w)), min(20, len(df_w)))
+    top_k = st.slider("Top-K", 5, len(df_w), min(20, len(df_w)))
     df_top = df_w.sort_values("abs_weight", ascending=False).head(top_k)
 
     st.dataframe(df_top[["feature", "weight"]], use_container_width=True)
